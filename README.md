@@ -13,14 +13,14 @@ cargo run --locked -- migrate
 cargo run --locked -- serve
 ```
 
-`serve` requires `GITHUB_WEBHOOK_SECRET`. Configure GitHub to send JSON to `https://your-public-host/webhook` with that same secret. HMAC SHA-256 is verified over the original request bytes with a constant-time comparison. Never expose the internal listener publicly.
+`serve` requires `GITHUB_WEBHOOK_SECRET`. Configure GitHub to send JSON to `https://your-public-host/webhook` with that same secret. HMAC SHA-256 is verified over the original request bytes with a constant-time comparison. The internal listener binds loopback by default. Container deployments can explicitly set `INTERNAL_BIND=0.0.0.0:9090` and restrict that port with private networking. Never expose the internal listener publicly.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DATABASE_URL` | required | Standard PostgreSQL connection URL; configure TLS for remote connections |
 | `GITHUB_WEBHOOK_SECRET` | required for serve | Shared webhook signing secret |
 | `WEBHOOK_BIND` | `0.0.0.0:8080` | Public listener, only `POST /webhook` |
-| `INTERNAL_BIND` | `0.0.0.0:9090` | Internal `/healthz`, `/readyz`, `/metrics` |
+| `INTERNAL_BIND` | `127.0.0.1:9090` | Internal `/healthz`, `/readyz`, `/metrics` |
 | `REPOSITORIES_INCLUDE` | empty | Comma-separated repository names or `*` |
 | `REPOSITORIES_EXCLUDE` | empty | Repository exclusions; exclusions win |
 | `EVENTS_INCLUDE` | empty | Comma-separated event types or `event.action` or `*` |

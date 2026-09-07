@@ -40,7 +40,7 @@ enum Command {
         webhook_secret: String,
         #[arg(long, env = "WEBHOOK_BIND", default_value = "0.0.0.0:8080")]
         webhook_bind: SocketAddr,
-        #[arg(long, env = "INTERNAL_BIND", default_value = "0.0.0.0:9090")]
+        #[arg(long, env = "INTERNAL_BIND", default_value = "127.0.0.1:9090")]
         internal_bind: SocketAddr,
     },
     /// Import all attempts/jobs of runs CREATED in an inclusive UTC interval.
