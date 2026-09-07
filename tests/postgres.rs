@@ -246,8 +246,8 @@ async fn durable_history_and_listener_boundaries() -> anyhow::Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
     let metrics = String::from_utf8(to_bytes(response.into_body(), 65536).await?.to_vec())?;
     assert!(metrics.contains("gha_observer_database_up 1"));
-    assert!(metrics.contains("gha_observer_completed_jobs_total{conclusion=\"failure\"} 1"));
-    assert!(metrics.contains("gha_observer_completed_jobs_total{conclusion=\"success\"} 0"));
+    assert!(metrics.contains("gha_observer_completed_jobs{conclusion=\"failure\"} 1"));
+    assert!(metrics.contains("gha_observer_completed_jobs{conclusion=\"success\"} 0"));
     let mut blocker = pool.begin().await?;
     sqlx::query("LOCK TABLE gha_jobs IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *blocker)

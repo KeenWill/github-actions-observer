@@ -57,7 +57,7 @@ WHERE completed_at >= $__timeFrom()
   AND completed_at < $__timeTo();
 ```
 
-No retention deletion is automatic yet. Plan and monitor database capacity; apply your retention policy to raw deliveries and completed history separately. Prometheus exposes process-local request counters, database query health, an observed active-job gauge, and durable completed-job totals with a fixed set of conclusion labels, without repository/job/delivery labels. Completion totals derive from retained job records: backfills increase them at import time, so `rate()` describes observed ingestion throughput, not historical completion times. Deleting history or correcting conclusions can decrease those per-conclusion totals; coordinate retention with your metrics policy. Detailed history lives in PostgreSQL, avoiding unbounded Prometheus series.
+No retention deletion is automatic yet. Plan and monitor database capacity; apply your retention policy to raw deliveries and completed history separately. Prometheus exposes process-local request counters, database query health, an observed active-job gauge, and durable completed-job count gauges with a fixed set of conclusion labels, without repository/job/delivery labels. Completion counts derive from retained job records: backfills increase them at import time, while deleting history or correcting conclusions can decrease them. They are gauges, not counters; do not use `rate()` or `increase()` on them. Query completion timestamps through SQL for throughput and historical counts. Detailed history lives in PostgreSQL, avoiding unbounded Prometheus series.
 
 ## Backfill
 

@@ -220,7 +220,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         output.push_str(&format!("gha_observer_active_jobs {count}\n"));
     }
     if let Ok(counts) = completed_jobs {
-        output.push_str("# HELP gha_observer_completed_jobs_total Retained completed jobs, including imports; exact event-time history is available through SQL.\n# TYPE gha_observer_completed_jobs_total counter\n");
+        output.push_str("# HELP gha_observer_completed_jobs Retained completed jobs, including imports; exact event-time history is available through SQL.\n# TYPE gha_observer_completed_jobs gauge\n");
         for conclusion in [
             "success",
             "failure",
@@ -238,7 +238,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 .find(|(key, _)| key == conclusion)
                 .map_or(0, |(_, count)| *count);
             output.push_str(&format!(
-                "gha_observer_completed_jobs_total{{conclusion=\"{conclusion}\"}} {count}\n"
+                "gha_observer_completed_jobs{{conclusion=\"{conclusion}\"}} {count}\n"
             ));
         }
     }
