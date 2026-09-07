@@ -295,3 +295,107 @@ async fn cache_rejects_public_permissions_and_symlinks() -> Result<()> {
     std::fs::remove_dir(directory)?;
     Ok(())
 }
+
+#[tokio::test]
+async fn nested_split_counts_must_match_each_parent_even_when_root_total_would_match() -> Result<()>
+{
+    let server = MockGitHub::start(
+        Router::new().route(
+            "/repos/example-org/example-repo/actions/runs",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                let (total, start) = match query["created"].as_str() {
+                    "2026-01-01T00:00:00Z..2026-01-01T00:00:03Z" => (2000, 0),
+                    "2026-01-01T00:00:00Z..2026-01-01T00:00:01Z" => (1001, 0),
+                    "2026-01-01T00:00:00Z..2026-01-01T00:00:00Z" => (500, 0),
+                    "2026-01-01T00:00:01Z..2026-01-01T00:00:01Z" => (500, 500),
+                    "2026-01-01T00:00:02Z..2026-01-01T00:00:03Z" => (1000, 1000),
+                    other => panic!("unexpected creation window: {other}"),
+                };
+                let page = query["page"].parse::<usize>().unwrap();
+                let runs: Vec<_> = ((page - 1) * 100..(page * 100).min(total))
+                    .map(|id| json!({"id":start+id+1}))
+                    .collect();
+                Json(json!({"total_count":total,"workflow_runs":runs}))
+            }),
+        ),
+        5000,
+    )
+    .await?;
+    let mut client = server.client(None, 40, 100).await?;
+    let error = client
+        .runs_in_window(
+            "example-org/example-repo",
+            CreatedWindow {
+                since: "2026-01-01T00:00:00Z".parse()?,
+                until: "2026-01-01T00:00:03Z".parse()?,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("expected 1001, collected 1000"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_cached_parent_must_match_new_child_counts() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let changed = Arc::new(AtomicBool::new(false));
+    let server_changed = Arc::clone(&changed);
+    let server = MockGitHub::start(
+        Router::new().route(
+            "/repos/example-org/example-repo/actions/runs",
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let changed = Arc::clone(&server_changed);
+                async move {
+                    let (total, start) = match query["created"].as_str() {
+                        "2026-01-01T00:00:00Z..2026-01-01T00:00:01Z" => (
+                            if changed.load(Ordering::Relaxed) {
+                                1000
+                            } else {
+                                1001
+                            },
+                            0,
+                        ),
+                        "2026-01-01T00:00:00Z..2026-01-01T00:00:00Z" => (500, 0),
+                        "2026-01-01T00:00:01Z..2026-01-01T00:00:01Z" => (500, 500),
+                        other => panic!("unexpected creation window: {other}"),
+                    };
+                    let page = query["page"].parse::<usize>().unwrap();
+                    let runs: Vec<_> = ((page - 1) * 100..(page * 100).min(total))
+                        .map(|id| json!({"id":start+id+1}))
+                        .collect();
+                    Json(json!({"total_count":total,"workflow_runs":runs}))
+                }
+            }),
+        ),
+        5000,
+    )
+    .await?;
+    let directory = temporary_path("split-resume")?;
+    let window = CreatedWindow {
+        since: "2026-01-01T00:00:00Z".parse()?,
+        until: "2026-01-01T00:00:01Z".parse()?,
+    };
+    let mut first = server.client(Some(directory.clone()), 2, 100).await?;
+    assert!(
+        first
+            .runs_in_window("example-org/example-repo", window)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("request budget reached")
+    );
+    assert_eq!(server.count(), 2);
+    changed.store(true, Ordering::Relaxed);
+    let mut resumed = server.client(Some(directory.clone()), 20, 100).await?;
+    let error = resumed
+        .runs_in_window("example-org/example-repo", window)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("expected 1001, collected 1000"));
+    assert_eq!(resumed.cache_hits, 1);
+    std::fs::remove_dir_all(directory)?;
+    Ok(())
+}

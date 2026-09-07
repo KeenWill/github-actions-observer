@@ -64,6 +64,14 @@ impl CreatedWindow {
     }
 }
 
+enum WindowTask {
+    Visit(CreatedWindow),
+    CheckSplit {
+        start_len: usize,
+        expected_total: u64,
+    },
+}
+
 impl GitHub {
     async fn pages(
         &mut self,
@@ -124,10 +132,24 @@ impl GitHub {
         repository: &str,
         initial: CreatedWindow,
     ) -> Result<Vec<Value>> {
-        let mut windows = vec![initial];
+        let mut windows = vec![WindowTask::Visit(initial)];
         let mut runs = Vec::new();
         let mut identifiers = std::collections::HashSet::new();
-        while let Some(window) = windows.pop() {
+        while let Some(task) = windows.pop() {
+            let window = match task {
+                WindowTask::Visit(window) => window,
+                WindowTask::CheckSplit {
+                    start_len,
+                    expected_total,
+                } => {
+                    let actual_total = (runs.len() - start_len) as u64;
+                    ensure!(
+                        actual_total == expected_total,
+                        "split-window result count changed: expected {expected_total}, collected {actual_total}; import incomplete; restart with a fresh cache directory for a consistent snapshot"
+                    );
+                    continue;
+                }
+            };
             match self
                 .pages(
                     &format!("repos/{repository}/actions/runs"),
@@ -140,7 +162,14 @@ impl GitHub {
                 Pages::TooMany(total) => {
                     tracing::info!(total, "splitting oversized run-creation window");
                     let (left, right) = window.split()?;
-                    windows.extend([right, left]);
+                    windows.extend([
+                        WindowTask::CheckSplit {
+                            start_len: runs.len(),
+                            expected_total: total,
+                        },
+                        WindowTask::Visit(right),
+                        WindowTask::Visit(left),
+                    ]);
                 }
                 Pages::Complete(page) => {
                     for run in page {
