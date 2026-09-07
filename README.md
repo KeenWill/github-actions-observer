@@ -33,7 +33,7 @@ Unrestricted filtering does **not** disable signature authentication. GitHub mus
 
 ## Delivery guarantees and data
 
-An authenticated, included JSON delivery receives HTTP 202 only after its raw JSON and supported projections commit in one transaction. Duplicate `(source, delivery_id)` receipts return 200 without repeating updates. Reusing an ID with different content fails. Filtered deliveries return 200 `filtered` and are deliberately not retained. Invalid signatures return 401; missing headers or invalid JSON return 400. Payloads are limited to 25 MiB. Database failures return 503 without acknowledging persistence.
+An authenticated, included JSON delivery receives HTTP 202 only after its raw JSON and supported projections commit in one transaction. Duplicate `(source, delivery_id)` receipts return 200 without repeating updates. Reusing an ID with different content fails. Filtered deliveries return 200 `filtered` and are deliberately not retained. Invalid signatures return 401; missing headers or invalid JSON return 400. Payloads are limited to 25 MiB. Database failures return 503 without acknowledging persistence. Pool acquisition is bounded to two seconds; statements to five seconds, lock waits to three seconds, and entire ingestion transactions to five seconds (PostgreSQL 17+). These limits leave room within GitHub’s webhook acknowledgement deadline.
 
 Unknown event types and structurally unsupported Actions payloads are retained, with `projection_status` set to `unhandled` or `invalid`. Their data is available for future projectors. Payloads and secrets are never intentionally logged. Raw deliveries may contain sensitive repository metadata: protect database access and backups accordingly.
 
@@ -57,7 +57,7 @@ WHERE completed_at >= $__timeFrom()
   AND completed_at < $__timeTo();
 ```
 
-No retention deletion is automatic yet. Plan and monitor database capacity; apply your retention policy to raw deliveries and completed history separately. Prometheus exposes process-local request counters, database query health and an observed active-job gauge, without repository/job/delivery labels. Detailed history lives in PostgreSQL, avoiding unbounded Prometheus series.
+No retention deletion is automatic yet. Plan and monitor database capacity; apply your retention policy to raw deliveries and completed history separately. Prometheus exposes process-local request counters, database query health, an observed active-job gauge, and durable completed-job totals with a fixed set of conclusion labels, without repository/job/delivery labels. Completion totals derive from retained job records: backfills increase them at import time, so `rate()` describes observed ingestion throughput, not historical completion times. Deleting history or correcting conclusions can decrease those per-conclusion totals; coordinate retention with your metrics policy. Detailed history lives in PostgreSQL, avoiding unbounded Prometheus series.
 
 ## Backfill
 

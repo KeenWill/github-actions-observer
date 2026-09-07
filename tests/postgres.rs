@@ -246,6 +246,30 @@ async fn durable_history_and_listener_boundaries() -> anyhow::Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
     let metrics = String::from_utf8(to_bytes(response.into_body(), 65536).await?.to_vec())?;
     assert!(metrics.contains("gha_observer_database_up 1"));
+    assert!(metrics.contains("gha_observer_completed_jobs_total{conclusion=\"failure\"} 1"));
+    assert!(metrics.contains("gha_observer_completed_jobs_total{conclusion=\"success\"} 0"));
+    let mut blocker = pool.begin().await?;
+    sqlx::query("LOCK TABLE gha_jobs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await?;
+    let started = std::time::Instant::now();
+    let blocked = store::ingest(
+        &pool,
+        Source::Webhook,
+        "blocked-timeout",
+        "workflow_job",
+        &job("completed", 1, 102),
+    )
+    .await;
+    assert!(blocked.is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    blocker.rollback().await?;
+    let persisted: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM gha_deliveries WHERE delivery_id='blocked-timeout')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(!persisted);
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)

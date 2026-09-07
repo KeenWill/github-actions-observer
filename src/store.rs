@@ -79,6 +79,9 @@ pub async fn ingest(
         Projection::Invalid => Outcome::Invalid,
     };
     let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL transaction_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
     let inserted = sqlx::query("INSERT INTO gha_deliveries (source,delivery_id,event,action,repository,payload,projection_status) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
         .bind(source.as_str()).bind(delivery_id).bind(event)
         .bind(payload.get("action").and_then(Value::as_str))

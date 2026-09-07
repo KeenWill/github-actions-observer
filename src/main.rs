@@ -9,8 +9,8 @@ use github_actions_observer::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::postgres::PgPoolOptions;
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Parser)]
@@ -84,10 +84,15 @@ async fn main() -> Result<()> {
         &arguments.events_include,
         &arguments.events_exclude,
     )?;
+    let mut database_options = PgConnectOptions::from_str(&arguments.database_url)?;
+    if !matches!(&arguments.command, Command::Migrate) {
+        database_options =
+            database_options.options([("statement_timeout", "5000"), ("lock_timeout", "3000")]);
+    }
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect(&arguments.database_url)
+        .acquire_timeout(Duration::from_secs(2))
+        .connect_with(database_options)
         .await
         .context("could not connect to PostgreSQL")?;
     match arguments.command {

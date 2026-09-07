@@ -203,18 +203,44 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
             counter.load(Ordering::Relaxed)
         ));
     }
-    let count =
+    let active_jobs =
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM gha_jobs WHERE status <> 'completed'")
             .fetch_one(&state.pool)
             .await;
-    output.push_str("# HELP gha_observer_database_up Whether the metrics database query succeeded.\n# TYPE gha_observer_database_up gauge\n");
+    let completed_jobs = sqlx::query_as::<_, (String, i64)>(
+        "SELECT CASE WHEN conclusion IN ('success','failure','cancelled','skipped','timed_out','action_required','neutral','stale','startup_failure') THEN conclusion ELSE 'other' END AS conclusion, count(*) FROM gha_jobs WHERE status='completed' GROUP BY 1"
+    ).fetch_all(&state.pool).await;
+    output.push_str("# HELP gha_observer_database_up Whether the metrics database queries succeeded.\n# TYPE gha_observer_database_up gauge\n");
     output.push_str(&format!(
         "gha_observer_database_up {}\n",
-        i32::from(count.is_ok())
+        i32::from(active_jobs.is_ok() && completed_jobs.is_ok())
     ));
-    if let Ok(count) = count {
+    if let Ok(count) = active_jobs {
         output.push_str("# HELP gha_observer_active_jobs Observed jobs without terminal state.\n# TYPE gha_observer_active_jobs gauge\n");
         output.push_str(&format!("gha_observer_active_jobs {count}\n"));
+    }
+    if let Ok(counts) = completed_jobs {
+        output.push_str("# HELP gha_observer_completed_jobs_total Retained completed jobs, including imports; exact event-time history is available through SQL.\n# TYPE gha_observer_completed_jobs_total counter\n");
+        for conclusion in [
+            "success",
+            "failure",
+            "cancelled",
+            "skipped",
+            "timed_out",
+            "action_required",
+            "neutral",
+            "stale",
+            "startup_failure",
+            "other",
+        ] {
+            let count = counts
+                .iter()
+                .find(|(key, _)| key == conclusion)
+                .map_or(0, |(_, count)| *count);
+            output.push_str(&format!(
+                "gha_observer_completed_jobs_total{{conclusion=\"{conclusion}\"}} {count}\n"
+            ));
+        }
     }
     (
         [(
