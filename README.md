@@ -67,12 +67,27 @@ Use a GitHub token with repository Actions read access in `GITHUB_TOKEN`. The to
 cargo run --locked -- backfill \
   --repository example-org/example-repo \
   --created-since 2026-01-01T00:00:00Z \
-  --created-until 2026-01-02T00:00:00Z
+  --created-until 2026-01-02T00:00:00Z \
+  --cache-dir /private/backfill-snapshots \
+  --max-requests 1000 \
+  --rate-limit-reserve 100
 ```
 
 Repeat `--repository` for multiple repositories. Bounds are inclusive, whole-second **run creation times**, not job completion times. A run created before the window may have jobs completed inside it and will not be discovered. Use a broad enough creation window for your recovery task. Adjacent overlapping windows are safe to reimport.
 
-All discovered run attempts are fetched separately, and job lists are paginated per attempt. More than 1,000 matching runs causes an explicit error: split the creation interval and rerun. No silent truncation is allowed. GitHub/API errors stop the import with a nonzero exit; earlier commits survive and reruns are idempotent. Backfill IDs hash the normalized payload and are separate from webhook IDs. The import preserves historical job timestamps without backdating Prometheus samples. Current repo/event filters also apply; backfill action is `backfill`, so an action-only include filter must explicitly allow that action.
+The listed run object supplies its latest attempt, avoiding a redundant metadata GET per run. Older attempt metadata is fetched separately, and job lists are paginated per attempt. Creation windows with more than 1,000 matching runs split recursively into inclusive whole-second windows `[start, midpoint]` and `[midpoint + 1 second, end]`. Exactly 1,000 results remain a valid paginated window. More than 1,000 runs created within a single second fails explicitly because that search cannot be partitioned further. Changed page counts, duplicate IDs and short pages fail rather than silently losing records. GitHub/API errors stop the import with a nonzero exit; earlier commits survive and reruns are idempotent. Backfill IDs hash the normalized payload and are separate from webhook IDs. The import preserves historical job timestamps without backdating Prometheus samples. Current repo/event filters also apply; backfill action is `backfill`, so an action-only include filter must explicitly allow that action.
+
+### Request budgets and resumable snapshots
+
+`--max-requests` defaults to 1,000 outbound GETs per invocation. `--rate-limit-reserve` defaults to 100 remaining primary requests. Before the first uncached data request, the importer calls `/rate_limit` once to establish available quota. That preflight counts toward the invocation's outbound GET budget; GitHub does not charge it to the primary allotment, though secondary limits still apply. Response headers update remaining/reset information after each request. The importer stops before the next request would consume the reserve or exceed its GET budget. Shared credentials can have concurrent consumers, so the reserve is based on the latest observed quota rather than an exclusive allocation.
+
+Requests are sequential. Automatic retries and redirects are disabled. Throttling produces a nonzero exit with `outbound_requests`, `cache_hits`, `remaining`, `reserve`, `reset_unix` and any `Retry-After` value. A wrapper may resume after the reported reset or delay; a secondary-limit response without `Retry-After` requires waiting at least one minute. Do not repeatedly restart a throttled import. There is no built-in scheduler or sleeping retry loop.
+
+Optional `--cache-dir` stores successful JSON response bodies plus their fetch timestamp, keyed by a hash of the request URL. It never stores the token, authorization headers, or rate-limit preflight. Cache hits consume no API requests; an entirely cached import works with `--max-requests 0` and does not perform a quota preflight. Use the same fixed creation window and cache directory to resume after a budget stop. Database imports remain idempotent, so completed portions can be processed again without creating duplicate history.
+
+These are **immutable per-request snapshots**, not a live refresh cache or a globally consistent GitHub snapshot. Cached active runs/jobs will not become completed merely by rerunning against the same directory. Start with a new cache directory when fresh data is needed, after changing the authenticated account or access scope, or if cached/live pagination becomes inconsistent. Missing pages are fetched on resume, and consistency checks reject detected count/ID changes. Use one importer per cache directory.
+
+Cache directories require Unix filesystem permissions: the importer creates the final directory with mode `0700` (its parent must exist) and writes files atomically with mode `0600`. Existing permissive paths and symlinks are rejected. Keep this directory outside any source repository: payloads can contain private repository/job metadata even though credentials are excluded. No automatic cache eviction is performed; delete snapshots according to your local retention policy.
 
 GitHub Enterprise deployments may override `--api-base` with an HTTPS API base ending in `/`. Redirects are disabled to avoid forwarding credentials unexpectedly.
 

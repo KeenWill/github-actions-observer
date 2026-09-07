@@ -55,6 +55,15 @@ enum Command {
         token: String,
         #[arg(long, default_value = "https://api.github.com/")]
         api_base: reqwest::Url,
+        /// Private immutable response snapshots; reuse the same directory to resume.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        /// Maximum outbound GETs per invocation, including quota preflight; cache hits are free.
+        #[arg(long, default_value_t = 1000)]
+        max_requests: u64,
+        /// Stop before consuming this many remaining primary API requests.
+        #[arg(long, default_value_t = 100)]
+        rate_limit_reserve: u64,
     },
     /// Import local JSONL envelopes; stable delivery IDs make reruns idempotent.
     Replay {
@@ -115,6 +124,9 @@ async fn main() -> Result<()> {
             created_until,
             token,
             api_base,
+            cache_dir,
+            max_requests,
+            rate_limit_reserve,
         } => {
             backfill(
                 &pool,
@@ -125,6 +137,9 @@ async fn main() -> Result<()> {
                     created_until,
                     token,
                     api_base,
+                    cache_dir,
+                    max_requests,
+                    rate_limit_reserve,
                 },
             )
             .await?

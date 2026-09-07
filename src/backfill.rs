@@ -1,13 +1,15 @@
+use crate::backfill_http::GitHub;
 use crate::{
     config::{Filters, valid_repository},
     store::{self, Source},
 };
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
-use reqwest::{Client, Url};
+use reqwest::Url;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::path::PathBuf;
 
 const PAGE_SIZE: usize = 100;
 const SEARCH_LIMIT: u64 = 1000;
@@ -18,43 +20,66 @@ pub struct BackfillOptions {
     pub created_until: DateTime<Utc>,
     pub token: String,
     pub api_base: Url,
+    pub cache_dir: Option<PathBuf>,
+    pub max_requests: u64,
+    pub rate_limit_reserve: u64,
 }
 
-struct GitHub {
-    client: Client,
-    base: Url,
-    token: String,
+#[derive(Debug)]
+enum Pages {
+    Complete(Vec<Value>),
+    TooMany(u64),
 }
-impl GitHub {
-    async fn get(&self, path: &str, parameters: &[(&str, String)]) -> Result<Value> {
-        let url = self.base.join(path)?;
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .query(parameters)
-            .send()
-            .await
-            .context("GitHub request failed")?;
-        ensure!(
-            response.status().is_success(),
-            "GitHub returned {}; import is incomplete and safe to rerun",
-            response.status()
-        );
-        response
-            .json()
-            .await
-            .context("invalid GitHub JSON response")
+
+#[derive(Clone, Copy, Debug)]
+struct CreatedWindow {
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+}
+impl CreatedWindow {
+    fn parameter(self) -> String {
+        format!(
+            "{}..{}",
+            self.since.to_rfc3339_opts(SecondsFormat::Secs, true),
+            self.until.to_rfc3339_opts(SecondsFormat::Secs, true)
+        )
     }
+    fn split(self) -> Result<(Self, Self)> {
+        ensure!(
+            self.since < self.until,
+            "more than 1000 runs share one creation second; GitHub's search cap prevents complete discovery"
+        );
+        let midpoint =
+            self.since.timestamp() + (self.until.timestamp() - self.since.timestamp()) / 2;
+        Ok((
+            Self {
+                since: self.since,
+                until: DateTime::from_timestamp(midpoint, 0).context("invalid midpoint")?,
+            },
+            Self {
+                since: DateTime::from_timestamp(midpoint + 1, 0).context("invalid midpoint")?,
+                until: self.until,
+            },
+        ))
+    }
+}
+
+enum WindowTask {
+    Visit(CreatedWindow),
+    CheckSplit {
+        start_len: usize,
+        expected_total: u64,
+    },
+}
+
+impl GitHub {
     async fn pages(
-        &self,
+        &mut self,
         path: &str,
         key: &str,
         parameters: &[(&str, String)],
         limit: Option<u64>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Pages> {
         let mut all = Vec::new();
         let mut identifiers = std::collections::HashSet::new();
         let mut expected_total = None;
@@ -69,11 +94,8 @@ impl GitHub {
             let total = response["total_count"]
                 .as_u64()
                 .context("missing total_count")?;
-            if let Some(limit) = limit {
-                ensure!(
-                    total <= limit,
-                    "creation window contains {total} runs, exceeding GitHub's {limit}-result limit; split the window and rerun"
-                );
+            if limit.is_some_and(|limit| total > limit) {
+                return Ok(Pages::TooMany(total));
             }
             ensure!(
                 expected_total.is_none_or(|expected| expected == total),
@@ -96,7 +118,7 @@ impl GitHub {
                 "GitHub returned more results than total_count; rerun import"
             );
             if all.len() as u64 == total {
-                return Ok(all);
+                return Ok(Pages::Complete(all));
             }
             ensure!(
                 items.len() == PAGE_SIZE,
@@ -104,6 +126,92 @@ impl GitHub {
             );
             page += 1;
         }
+    }
+    async fn runs_in_window(
+        &mut self,
+        repository: &str,
+        initial: CreatedWindow,
+    ) -> Result<Vec<Value>> {
+        let mut windows = vec![WindowTask::Visit(initial)];
+        let mut runs = Vec::new();
+        let mut identifiers = std::collections::HashSet::new();
+        while let Some(task) = windows.pop() {
+            let window = match task {
+                WindowTask::Visit(window) => window,
+                WindowTask::CheckSplit {
+                    start_len,
+                    expected_total,
+                } => {
+                    let actual_total = (runs.len() - start_len) as u64;
+                    ensure!(
+                        actual_total == expected_total,
+                        "split-window result count changed: expected {expected_total}, collected {actual_total}; import incomplete; restart with a fresh cache directory for a consistent snapshot"
+                    );
+                    continue;
+                }
+            };
+            match self
+                .pages(
+                    &format!("repos/{repository}/actions/runs"),
+                    "workflow_runs",
+                    &[("created", window.parameter())],
+                    Some(SEARCH_LIMIT),
+                )
+                .await?
+            {
+                Pages::TooMany(total) => {
+                    tracing::info!(total, "splitting oversized run-creation window");
+                    let (left, right) = window.split()?;
+                    windows.extend([
+                        WindowTask::CheckSplit {
+                            start_len: runs.len(),
+                            expected_total: total,
+                        },
+                        WindowTask::Visit(right),
+                        WindowTask::Visit(left),
+                    ]);
+                }
+                Pages::Complete(page) => {
+                    for run in page {
+                        let identifier = run["id"].as_i64().context("run missing id")?;
+                        ensure!(
+                            identifiers.insert(identifier),
+                            "run repeated across non-overlapping creation windows; import incomplete"
+                        );
+                        runs.push(run);
+                    }
+                }
+            }
+        }
+        Ok(runs)
+    }
+
+    async fn run_attempt(
+        &mut self,
+        repository: &str,
+        listed: &Value,
+        attempt: i64,
+    ) -> Result<Value> {
+        let latest = listed["run_attempt"]
+            .as_i64()
+            .context("run missing run_attempt")?;
+        ensure!(attempt > 0 && attempt <= latest, "invalid run attempt");
+        if attempt == latest {
+            return Ok(listed.clone());
+        }
+        let run_id = listed["id"].as_i64().context("run missing id")?;
+        let historical = self
+            .get(
+                &format!("repos/{repository}/actions/runs/{run_id}/attempts/{attempt}"),
+                &[],
+            )
+            .await?;
+        ensure!(
+            historical["id"].as_i64() == Some(run_id)
+                && historical["run_attempt"].as_i64() == Some(attempt),
+            "GitHub returned a different run or attempt than requested"
+        );
+        Ok(historical)
     }
 }
 
@@ -120,8 +228,8 @@ pub async fn backfill(pool: &PgPool, filters: &Filters, options: BackfillOptions
         "repositories must be owner/repository"
     );
     ensure!(
-        options.created_since < options.created_until,
-        "created-since must be before created-until"
+        options.created_since <= options.created_until,
+        "created-since must not be after created-until"
     );
     ensure!(
         options.created_since.timestamp_subsec_nanos() == 0
@@ -147,34 +255,22 @@ pub async fn backfill(pool: &PgPool, filters: &Filters, options: BackfillOptions
         !options.token.trim().is_empty(),
         "GITHUB_TOKEN must not be empty"
     );
-    let github = GitHub {
-        client: Client::builder()
-            .user_agent("github-actions-observer")
-            .timeout(std::time::Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
-        base: options.api_base,
-        token: options.token,
+    let mut github = GitHub::new(
+        options.api_base,
+        options.token,
+        options.cache_dir,
+        options.max_requests,
+        options.rate_limit_reserve,
+    )
+    .await?;
+    let window = CreatedWindow {
+        since: options.created_since,
+        until: options.created_until,
     };
-    let created = format!(
-        "{}..{}",
-        options
-            .created_since
-            .to_rfc3339_opts(SecondsFormat::Secs, true),
-        options
-            .created_until
-            .to_rfc3339_opts(SecondsFormat::Secs, true)
-    );
+    let result: Result<()> = async {
     for repository_name in options.repositories {
         let repository = github.get(&format!("repos/{repository_name}"), &[]).await?;
-        let runs = github
-            .pages(
-                &format!("repos/{repository_name}/actions/runs"),
-                "workflow_runs",
-                &[("created", created.clone())],
-                Some(SEARCH_LIMIT),
-            )
-            .await?;
+        let runs = github.runs_in_window(&repository_name,window).await?;
         for run in runs {
             let run_id = run["id"].as_i64().context("run missing id")?;
             let attempt_count = run["run_attempt"]
@@ -182,19 +278,12 @@ pub async fn backfill(pool: &PgPool, filters: &Filters, options: BackfillOptions
                 .context("run missing run_attempt")?;
             ensure!(attempt_count > 0, "run_attempt must be positive");
             for attempt in 1..=attempt_count {
-                let historical_run = github
-                    .get(
-                        &format!(
-                            "repos/{repository_name}/actions/runs/{run_id}/attempts/{attempt}"
-                        ),
-                        &[],
-                    )
-                    .await?;
+                let historical_run = github.run_attempt(&repository_name, &run, attempt).await?;
                 import(pool, filters, "workflow_run", json!({"action":"backfill", "repository":repository, "workflow_run":historical_run})).await?;
                 import_jobs(
                     pool,
                     filters,
-                    &github,
+                    &mut github,
                     &repository_name,
                     &repository,
                     run_id,
@@ -205,25 +294,32 @@ pub async fn backfill(pool: &PgPool, filters: &Filters, options: BackfillOptions
         }
     }
     Ok(())
+    }.await;
+    let report = github.report();
+    tracing::info!(%report, "backfill invocation finished");
+    result.with_context(|| report)
 }
 
 async fn import_jobs(
     pool: &PgPool,
     filters: &Filters,
-    github: &GitHub,
+    github: &mut GitHub,
     repository_name: &str,
     repository: &Value,
     run_id: i64,
     attempt: i64,
 ) -> Result<()> {
-    let jobs = github
+    let Pages::Complete(jobs) = github
         .pages(
             &format!("repos/{repository_name}/actions/runs/{run_id}/attempts/{attempt}/jobs"),
             "jobs",
             &[],
             None,
         )
-        .await?;
+        .await?
+    else {
+        bail!("unexpected job-list search limit");
+    };
     for job in jobs {
         let mut job = job;
         job.as_object_mut()
@@ -256,57 +352,5 @@ async fn import(pool: &PgPool, filters: &Filters, event: &str, payload: Value) -
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::{Json, Router, extract::Query, routing::get};
-    use std::collections::HashMap;
-
-    #[tokio::test]
-    async fn pagination_collects_all_pages_and_rejects_truncation() -> Result<()> {
-        let router = Router::new()
-            .route(
-                "/complete",
-                get(|Query(query): Query<HashMap<String, String>>| async move {
-                    let page = query
-                        .get("page")
-                        .and_then(|page| page.parse::<usize>().ok())
-                        .unwrap_or(1);
-                    let jobs: Vec<_> = if page == 1 {
-                        (0..100).map(|id| json!({"id":id})).collect()
-                    } else {
-                        vec![json!({"id":100})]
-                    };
-                    Json(json!({"total_count":101,"jobs":jobs}))
-                }),
-            )
-            .route(
-                "/short",
-                get(|| async { Json(json!({"total_count":101,"jobs":[{"id":1}]})) }),
-            )
-            .route(
-                "/over-limit",
-                get(|| async { Json(json!({"total_count":1001,"jobs":[]})) }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-        let server = tokio::spawn(async move { axum::serve(listener, router).await });
-        let github = GitHub {
-            client: Client::new(),
-            base: Url::parse(&format!("http://{address}/"))?,
-            token: "synthetic-test-token".into(),
-        };
-        assert_eq!(
-            github.pages("complete", "jobs", &[], None).await?.len(),
-            101
-        );
-        assert!(github.pages("short", "jobs", &[], None).await.is_err());
-        assert!(
-            github
-                .pages("over-limit", "jobs", &[], Some(SEARCH_LIMIT))
-                .await
-                .is_err()
-        );
-        server.abort();
-        Ok(())
-    }
-}
+#[path = "backfill_tests.rs"]
+mod tests;
