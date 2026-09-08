@@ -115,6 +115,32 @@ async fn repairs_missing_cancellation_discovers_queue_and_preserves_payloads() -
             .await?,
         2
     );
+    // A delivery-ID conflict rolls back the entire batch, including preceding writes.
+    let bad_batch = vec![
+        (
+            "batch-new".into(),
+            "workflow_run".into(),
+            json!({"repository":repository,"workflow_run":run(3,"queued")}),
+        ),
+        (
+            "queued".into(),
+            "workflow_run".into(),
+            json!({"repository":repository,"workflow_run":run(999,"queued")}),
+        ),
+    ];
+    assert!(
+        store::ingest_batch(&pool, Source::Webhook, &bad_batch)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM gha_deliveries WHERE delivery_id='batch-new'"
+        )
+        .fetch_one(&pool)
+        .await?,
+        0
+    );
     server.abort();
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))

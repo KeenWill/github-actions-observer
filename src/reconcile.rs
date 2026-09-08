@@ -22,20 +22,32 @@ pub struct ReconcileOptions {
     pub rate_limit_reserve: u64,
 }
 
-async fn import(pool: &PgPool, filters: &Filters, event: &str, payload: Value) -> Result<()> {
-    ensure!(
-        filters.accepts(event, &payload),
-        "reconciliation event excluded by filters"
-    );
-    let delivery = format!(
-        "{event}:{}",
-        hex::encode(Sha256::digest(serde_json::to_vec(&payload)?))
-    );
-    ensure!(
-        store::ingest(pool, Source::Reconcile, &delivery, event, &payload).await?
-            != store::Outcome::Invalid,
-        "API payload retained but projection invalid"
-    );
+const REPAIR_BATCH_SIZE: usize = 16;
+
+async fn import_batch(
+    pool: &PgPool,
+    filters: &Filters,
+    payloads: Vec<(&str, Value)>,
+) -> Result<()> {
+    let mut deliveries = Vec::with_capacity(payloads.len());
+    for (event, payload) in payloads {
+        ensure!(
+            filters.accepts(event, &payload),
+            "reconciliation event excluded by filters"
+        );
+        let delivery = format!(
+            "{event}:{}",
+            hex::encode(Sha256::digest(serde_json::to_vec(&payload)?))
+        );
+        deliveries.push((delivery, event.to_owned(), payload));
+    }
+    for batch in deliveries.chunks(REPAIR_BATCH_SIZE) {
+        let outcomes = store::ingest_batch(pool, Source::Reconcile, batch).await?;
+        ensure!(
+            !outcomes.contains(&store::Outcome::Invalid),
+            "API payload retained but projection invalid"
+        );
+    }
     Ok(())
 }
 
@@ -82,26 +94,23 @@ async fn refresh_run(
         else {
             anyhow::bail!("job pagination incomplete")
         };
+        let mut payloads = Vec::with_capacity(jobs.len() + 1);
         for mut job in jobs {
             job.as_object_mut()
                 .context("job must be an object")?
                 .insert("run_attempt".into(), Value::from(attempt));
-            import(
-                pool,
-                filters,
+            payloads.push((
                 "workflow_job",
                 json!({"action":"reconcile","repository":repository,"workflow_job":job}),
-            )
-            .await?;
+            ));
         }
-        import(
-            pool,
-            filters,
+        payloads.push((
             "workflow_run",
             json!({"action":"reconcile","repository":repository,"workflow_run":attempt_run}),
-        )
-        .await?;
+        ));
+        import_batch(pool, filters, payloads).await?;
     }
+
     sqlx::query("INSERT INTO gha_reconciled_runs(repository_id,run_id) VALUES($1,$2) ON CONFLICT(repository_id,run_id) DO UPDATE SET checked_at=now()")
         .bind(repository["id"].as_i64().context("repository missing id")?).bind(model.id.0).execute(pool).await?;
     Ok(())
