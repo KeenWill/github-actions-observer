@@ -112,3 +112,58 @@ Set `TEST_DATABASE_URL` to run the PostgreSQL integration test. It creates and d
 Build the portable container with `docker build -t github-actions-observer .`. It runs as an unprivileged user. Run `migrate` as a separate deployment job before `serve`. Configure platform probes and private metrics discovery against port 9090.
 
 Version tags such as `v0.1.0` trigger the generic GHCR publication workflow, publishing `ghcr.io/<repository-owner>/<repository-name>:0.1.0`. The repository's `GITHUB_TOKEN` needs package-write permission; registry/package visibility is managed by the repository owner. Tags must use `vMAJOR.MINOR.PATCH`.
+
+## Live queue reconciliation
+
+`reconcile` complements webhook ingestion with fresh GitHub API observations:
+
+```sh
+github-actions-observer reconcile --max-requests 1000 --rate-limit-reserve 500
+```
+
+Set `GITHUB_TOKEN` to an Actions/metadata read token. Known repositories are discovered
+from stored runs/jobs; repeat `--repository owner/name` to seed additional repositories.
+Filters apply. Each invocation first lists active runs for every included repository,
+then repairs unresolved workflow attempts and jobs, oldest verification first. It also
+imports newly discovered active runs. Full API run/job objects are retained in
+`gha_deliveries` with `source=reconcile`; original webhook deliveries remain intact.
+There is no automatic deletion of payloads or history. API calls consume GitHub rate
+quota; they do not run CI jobs. Storage grows with retained observations.
+
+Schedule this command independently of the webhook receiver. Use a non-overlapping
+five-minute schedule and choose a request budget compatible with the installation's
+quota. The same reserve and fail-fast throttling rules as backfill apply. Partial
+repairs are durable and repeatable; rerun to continue. Reconciliation deliberately
+never uses immutable backfill caches. Inaccessible/deleted runs currently fail the
+invocation and require operator investigation; they are never silently treated as
+completed. The current active-run search cap of 1,000 per repository/status fails
+explicitly instead of emitting a truncated queue.
+
+`gha_queue_snapshots` and `gha_queue_snapshot_runs` record successful complete API
+queue listings, including empty queues. An API listing spans multiple sequential
+requests, not an atomic GitHub snapshot. Failed/incomplete listings emit no snapshot.
+Snapshots precede history repair, so queue visibility remains independent of a large
+repair backlog. Use verification time/freshness in dashboards and show unknown when
+checks are absent or too old. Queue depth before this feature was enabled cannot be
+reconstructed reliably from missing events. Do not fabricate historical zeros.
+
+Grant the reconciliation role SELECT/INSERT/UPDATE on the new tables and USAGE on
+`gha_queue_snapshots_id_seq`, in addition to its existing ingestion grants. Grant
+Grafana SELECT on the two snapshot tables and `gha_job_execution`. Keep raw deliveries
+restricted to trusted database operators.
+
+## Runner placement
+
+`runner-hosts --interval-seconds 10` optionally records ARC runner pod names, UIDs,
+namespaces and Kubernetes nodes using an in-cluster service account with pod list
+access. This is a separate opt-in process; the webhook receiver needs no Kubernetes
+access. TLS verifies the mounted cluster CA. Only pods carrying the standard
+`actions.github.com/scale-set-name` label and assigned a node are recorded.
+
+`gha_job_execution` extends existing history with runner placement when the GitHub
+runner name exactly matches an observed pod name and the job started between the pod's
+creation and last observation. Pod UIDs preserve reused-name distinctions. Unobserved
+short-lived pods, old deleted pods, custom runner names and GitHub-hosted runners remain
+unknown. This is an observed mapping, not a guess. Existing history already exposes
+runner group, labels, event, attempts, URLs, durations and step timing; unmodeled GitHub
+fields remain available in the archived payloads.

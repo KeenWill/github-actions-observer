@@ -10,6 +10,7 @@ pub enum Source {
     Webhook,
     Backfill,
     Replay,
+    Reconcile,
 }
 impl Source {
     pub fn as_str(self) -> &'static str {
@@ -17,6 +18,7 @@ impl Source {
             Self::Webhook => "webhook",
             Self::Backfill => "backfill",
             Self::Replay => "replay",
+            Self::Reconcile => "reconcile",
         }
     }
 }

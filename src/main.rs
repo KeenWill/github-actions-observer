@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use github_actions_observer::{
     backfill::{BackfillOptions, backfill},
     config::Filters,
+    reconcile::{ReconcileOptions, reconcile},
     server::{AppState, serve},
     store::{self, Source},
 };
@@ -65,6 +66,25 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         rate_limit_reserve: u64,
     },
+    /// Refresh active workflow/job records and store verified queue snapshots.
+    Reconcile {
+        #[arg(long = "repository")]
+        repositories: Vec<String>,
+        #[arg(long, env = "GITHUB_TOKEN", hide_env_values = true)]
+        token: String,
+        #[arg(long, default_value = "https://api.github.com/")]
+        api_base: reqwest::Url,
+        #[arg(long, default_value_t = 1000)]
+        max_requests: u64,
+        #[arg(long, default_value_t = 500)]
+        rate_limit_reserve: u64,
+    },
+    /// Record ARC pod-to-worker mappings using an in-cluster pod-reader service account.
+    RunnerHosts {
+        /// Repeat collection at this interval; omit for one collection.
+        #[arg(long, value_parser=clap::value_parser!(u64).range(5..))]
+        interval_seconds: Option<u64>,
+    },
     /// Import local JSONL envelopes; stable delivery IDs make reruns idempotent.
     Replay {
         #[arg(long)]
@@ -100,7 +120,13 @@ async fn main() -> Result<()> {
     }
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        .acquire_timeout(Duration::from_secs(2))
+        .acquire_timeout(Duration::from_secs(
+            if matches!(&arguments.command, Command::Serve { .. }) {
+                2
+            } else {
+                30
+            },
+        ))
         .connect_with(database_options)
         .await
         .context("could not connect to PostgreSQL")?;
@@ -144,6 +170,40 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::Reconcile {
+            repositories,
+            token,
+            api_base,
+            max_requests,
+            rate_limit_reserve,
+        } => {
+            reconcile(
+                &pool,
+                &filters,
+                ReconcileOptions {
+                    repositories,
+                    token,
+                    api_base,
+                    max_requests,
+                    rate_limit_reserve,
+                },
+            )
+            .await?;
+        }
+        Command::RunnerHosts { interval_seconds } => loop {
+            let result = github_actions_observer::runner_hosts::collect(&pool).await;
+            if let Some(seconds) = interval_seconds {
+                if result.is_err() {
+                    tracing::error!(
+                        "runner host collection failed; retrying at configured interval"
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(seconds)).await;
+            } else {
+                result?;
+                break;
+            }
+        },
         Command::Replay { input } => {
             let file = tokio::fs::File::open(input).await?;
             let mut lines = BufReader::new(file).lines();
