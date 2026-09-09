@@ -70,8 +70,15 @@ enum Command {
     Reconcile {
         #[arg(long = "repository")]
         repositories: Vec<String>,
-        #[arg(long, env = "GITHUB_TOKEN", hide_env_values = true)]
-        token: String,
+        #[arg(long, env = "GITHUB_TOKEN", hide_env_values = true, required_unless_present = "app_id", conflicts_with_all = ["app_id", "installation_id", "private_key_file"])]
+        token: Option<String>,
+        /// GitHub App client ID or application ID used as the JWT issuer.
+        #[arg(long, env = "GITHUB_APP_ID", requires_all = ["installation_id", "private_key_file"])]
+        app_id: Option<String>,
+        #[arg(long, env = "GITHUB_APP_INSTALLATION_ID", requires = "app_id", value_parser=clap::value_parser!(u64).range(1..))]
+        installation_id: Option<u64>,
+        #[arg(long, env = "GITHUB_APP_PRIVATE_KEY_FILE", requires = "app_id")]
+        private_key_file: Option<PathBuf>,
         #[arg(long, default_value = "https://api.github.com/")]
         api_base: reqwest::Url,
         #[arg(long, default_value_t = 1000)]
@@ -173,10 +180,27 @@ async fn main() -> Result<()> {
         Command::Reconcile {
             repositories,
             token,
+            app_id,
+            installation_id,
+            private_key_file,
             api_base,
             max_requests,
             rate_limit_reserve,
         } => {
+            github_actions_observer::github_app::validate_api_base(&api_base)?;
+            let token = match (token, app_id, installation_id, private_key_file) {
+                (Some(token), None, None, None) => token,
+                (None, Some(issuer), Some(installation), Some(key_file)) => {
+                    github_actions_observer::github_app::installation_token(
+                        &api_base,
+                        &issuer,
+                        installation,
+                        &key_file,
+                    )
+                    .await?
+                }
+                _ => anyhow::bail!("supply either GITHUB_TOKEN or complete GitHub App credentials"),
+            };
             reconcile(
                 &pool,
                 &filters,
@@ -231,4 +255,62 @@ async fn main() -> Result<()> {
     }
     pool.close().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parses(args: Vec<&str>) -> bool {
+        let command = Arguments::command()
+            .mut_arg("database_url", |arg| arg.env(None::<&str>))
+            .mut_subcommand("reconcile", |mut command| {
+                for name in ["token", "app_id", "installation_id", "private_key_file"] {
+                    command = command.mut_arg(name, |arg| arg.env(None::<&str>));
+                }
+                command
+            });
+        command
+            .try_get_matches_from(
+                ["observer", "--database-url", "postgres://test", "reconcile"]
+                    .into_iter()
+                    .chain(args),
+            )
+            .is_ok()
+    }
+
+    #[test]
+    fn reconcile_requires_exactly_one_complete_authentication_method() {
+        for args in [
+            vec!["--token", "test"],
+            vec![
+                "--app-id",
+                "app",
+                "--installation-id",
+                "42",
+                "--private-key-file",
+                "/key.pem",
+            ],
+        ] {
+            assert!(parses(args));
+        }
+        for args in [
+            vec![],
+            vec!["--app-id", "app"],
+            vec!["--installation-id", "42"],
+            vec!["--private-key-file", "/key.pem"],
+            vec!["--token", "test", "--app-id", "app"],
+            vec![
+                "--app-id",
+                "app",
+                "--installation-id",
+                "0",
+                "--private-key-file",
+                "/key.pem",
+            ],
+        ] {
+            assert!(!parses(args));
+        }
+    }
 }

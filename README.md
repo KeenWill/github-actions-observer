@@ -61,7 +61,7 @@ No retention deletion is automatic yet. Plan and monitor database capacity; appl
 
 ## Backfill
 
-Use a GitHub token with repository Actions read access in `GITHUB_TOKEN`. The token is only required by `backfill`, never by `serve`.
+Use a GitHub token with repository Actions read access in `GITHUB_TOKEN`. `backfill` requires this token; `reconcile` also accepts GitHub App authentication. `serve` needs neither API credentials nor an App key.
 
 ```sh
 cargo run --locked -- backfill \
@@ -121,7 +121,7 @@ Version tags such as `v0.1.0` trigger the generic GHCR publication workflow, pub
 github-actions-observer reconcile --max-requests 1000 --rate-limit-reserve 500
 ```
 
-Set `GITHUB_TOKEN` to an Actions/metadata read token. Known repositories are discovered
+Authenticate with either `GITHUB_TOKEN` (Actions/metadata read access) or the GitHub App settings below. Known repositories are discovered
 from stored runs/jobs; repeat `--repository owner/name` to seed additional repositories.
 Filters apply. Each invocation first lists active runs for every included repository,
 then repairs unresolved workflow attempts and jobs, oldest verification first. It also
@@ -129,6 +129,28 @@ imports newly discovered active runs. Full API run/job objects are retained in
 `gha_deliveries` with `source=reconcile`; original webhook deliveries remain intact.
 There is no automatic deletion of payloads or history. API calls consume GitHub rate
 quota; they do not run CI jobs. Storage grows with retained observations.
+
+For scheduled collection, set `GITHUB_APP_ID` (client ID or App ID),
+`GITHUB_APP_INSTALLATION_ID`, and `GITHUB_APP_PRIVATE_KEY_FILE` (a mounted RSA PEM
+file). Leave `GITHUB_TOKEN` unset: the two authentication modes are mutually
+exclusive. Each invocation signs an RS256 JWT with 60 seconds of clock-skew
+allowance and an eight-minute lifetime, then requests a fresh installation token
+limited to `actions:read` and `metadata:read`. The key and token stay out of logs;
+the installation token exists only in process memory. Whitespace-flattened PEM
+files are accepted as well as multiline PEM. The API base must use HTTPS and end
+in `/`; authenticated requests never follow redirects or retry automatically.
+Keep invocation deadlines below the installation token's lifetime (GitHub normally
+issues one-hour tokens); short scheduled runs do not need in-process renewal.
+
+```sh
+# Supply these settings through your secret manager/environment, not literal keys.
+github-actions-observer reconcile --max-requests 500 --rate-limit-reserve 1000
+```
+
+The App token exchange is one additional request outside the API read budget.
+Give only the collector access to the key; the receiver and runner mapper do not
+need it. See [GitHub App authentication](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)
+for registration and issuer requirements.
 
 Schedule this command independently of the webhook receiver. Use a non-overlapping
 five-minute schedule and choose a request budget compatible with the installation's
