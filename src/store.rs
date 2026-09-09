@@ -10,6 +10,7 @@ pub enum Source {
     Webhook,
     Backfill,
     Replay,
+    Reconcile,
 }
 impl Source {
     pub fn as_str(self) -> &'static str {
@@ -17,6 +18,7 @@ impl Source {
             Self::Webhook => "webhook",
             Self::Backfill => "backfill",
             Self::Replay => "replay",
+            Self::Reconcile => "reconcile",
         }
     }
 }
@@ -72,21 +74,54 @@ pub async fn ingest(
     event: &str,
     payload: &Value,
 ) -> Result<Outcome> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL transaction_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    let outcome =
+        ingest_in_transaction(&mut transaction, source, delivery_id, event, payload).await?;
+    transaction.commit().await?;
+    Ok(outcome)
+}
+
+/// Persist a bounded repair batch with one durable commit, preserving delivery idempotence.
+pub async fn ingest_batch(
+    pool: &PgPool,
+    source: Source,
+    deliveries: &[(String, String, Value)],
+) -> Result<Vec<Outcome>> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL transaction_timeout = '5s'")
+        .execute(&mut *transaction)
+        .await?;
+    let mut outcomes = Vec::with_capacity(deliveries.len());
+    for (delivery_id, event, payload) in deliveries {
+        outcomes.push(
+            ingest_in_transaction(&mut transaction, source, delivery_id, event, payload).await?,
+        );
+    }
+    transaction.commit().await?;
+    Ok(outcomes)
+}
+
+async fn ingest_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    source: Source,
+    delivery_id: &str,
+    event: &str,
+    payload: &Value,
+) -> Result<Outcome> {
     let projection = projection(event, payload);
     let outcome = match &projection {
         Projection::Run(..) | Projection::Job(..) => Outcome::Projected,
         Projection::Unhandled => Outcome::Unhandled,
         Projection::Invalid => Outcome::Invalid,
     };
-    let mut transaction = pool.begin().await?;
-    sqlx::query("SET LOCAL transaction_timeout = '5s'")
-        .execute(&mut *transaction)
-        .await?;
     let inserted = sqlx::query("INSERT INTO gha_deliveries (source,delivery_id,event,action,repository,payload,projection_status) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
         .bind(source.as_str()).bind(delivery_id).bind(event)
         .bind(payload.get("action").and_then(Value::as_str))
         .bind(payload.pointer("/repository/full_name").and_then(Value::as_str).map(str::to_ascii_lowercase))
-        .bind(payload).bind(outcome.as_str()).execute(&mut *transaction).await?.rows_affected();
+        .bind(payload).bind(outcome.as_str()).execute(&mut **transaction).await?.rows_affected();
     if inserted == 0 {
         let matches: bool = sqlx::query_scalar(
             "SELECT event=$3 AND payload=$4 FROM gha_deliveries WHERE source=$1 AND delivery_id=$2",
@@ -95,25 +130,19 @@ pub async fn ingest(
         .bind(delivery_id)
         .bind(event)
         .bind(payload)
-        .fetch_one(&mut *transaction)
+        .fetch_one(&mut **transaction)
         .await?;
         ensure!(
             matches,
             "delivery identifier reused with a different event or payload"
         );
-        transaction.commit().await?;
         return Ok(Outcome::Duplicate);
     }
     match projection {
-        Projection::Run(repository, run) => {
-            project_run(&mut transaction, &repository, &run).await?
-        }
-        Projection::Job(repository, job) => {
-            project_job(&mut transaction, &repository, &job).await?
-        }
+        Projection::Run(repository, run) => project_run(transaction, &repository, &run).await?,
+        Projection::Job(repository, job) => project_job(transaction, &repository, &job).await?,
         Projection::Unhandled | Projection::Invalid => {}
     }
-    transaction.commit().await?;
     Ok(outcome)
 }
 
