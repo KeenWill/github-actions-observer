@@ -26,7 +26,7 @@ pub struct BackfillOptions {
 }
 
 #[derive(Debug)]
-enum Pages {
+pub(crate) enum Pages {
     Complete(Vec<Value>),
     TooMany(u64),
 }
@@ -73,7 +73,7 @@ enum WindowTask {
 }
 
 impl GitHub {
-    async fn pages(
+    pub(crate) async fn pages(
         &mut self,
         path: &str,
         key: &str,
