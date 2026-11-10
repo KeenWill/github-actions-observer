@@ -122,7 +122,9 @@ impl GitHub {
             }
             ensure!(
                 items.len() == PAGE_SIZE,
-                "GitHub returned a short page before total_count was reached; import incomplete"
+                "GitHub returned a short page before total_count was reached; import incomplete: path={path}, parameters={parameters:?}, page={page}, page_items={}, collected={}, total_count={total}, per_page={PAGE_SIZE}",
+                items.len(),
+                all.len()
             );
             page += 1;
         }
