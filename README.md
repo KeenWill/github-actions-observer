@@ -107,7 +107,9 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Set `TEST_DATABASE_URL` to run the PostgreSQL integration test. It creates and drops its own unique schema and requires schema-creation permission. Without the variable, that test reports a skip; CI always provides PostgreSQL. Tests cover signatures/filtering, delivery deduplication, ordering, reruns, transaction rollback, exact SQL time boundaries and listener separation.
+Set `TEST_DATABASE_URL` to run the PostgreSQL integration tests against a disposable PostgreSQL 17+ database. Each test creates and drops its own unique schema and requires schema-creation permission. Without the variable, database tests report a skip. Tests cover signatures/filtering, delivery deduplication, ordering, reruns, transaction rollback, exact SQL time boundaries and listener separation.
+
+`cargo test --locked --test recovery_atomicity -- --nocapture` checks snapshot publication using independent PostgreSQL readers, controlled HTTP pages and separate collector processes. It covers incomplete second pages, exhausted recovery budgets, process termination before retry and during an uncommitted transaction, complete replacement, and deduplication across statuses and repeated invocations. A test-only trigger pauses the second snapshot member insertion; `pg_locks` confirms the writer is blocked after inserting the header and first member. Readers must still see the exact prior snapshot. The test prints `DATABASE_RECEIPT` rows for each boundary. Its ignored `reconcile_subprocess` helper is invoked automatically in child processes; run the parent test, not the helper directly. This exercises the reconciliation library in separate processes, not CLI authentication or deployment.
 
 Build the portable container with `docker build -t github-actions-observer .`. It runs as an unprivileged user. Run `migrate` as a separate deployment job before `serve`. Configure platform probes and private metrics discovery against port 9090.
 
@@ -138,7 +140,8 @@ allowance and an eight-minute lifetime, then requests a fresh installation token
 limited to `actions:read` and `metadata:read`. The key and token stay out of logs;
 the installation token exists only in process memory. Whitespace-flattened PEM
 files are accepted as well as multiline PEM. The API base must use HTTPS and end
-in `/`; authenticated requests never follow redirects or retry automatically.
+in `/`; authenticated requests never follow redirects. Transport errors and
+non-success HTTP responses are not retried automatically.
 Keep invocation deadlines below the installation token's lifetime (GitHub normally
 issues one-hour tokens); short scheduled runs do not need in-process renewal.
 
@@ -160,6 +163,15 @@ never uses immutable backfill caches. Inaccessible/deleted runs currently fail t
 invocation and require operator investigation; they are never silently treated as
 completed. The current active-run search cap of 1,000 per repository/status fails
 explicitly instead of emitting a truncated queue.
+
+If an active-status run listing returns a short page before its advertised total
+is reached, reconciliation discards that entire filtered listing and restarts it
+once from page one. Every request consumes the same invocation budget and obeys
+the same rate-limit reserve. A second short page, changed total within an attempt,
+duplicate ID, malformed response, search cap, or HTTP failure still fails the
+listing. Totals are never lowered to accept incomplete results. Each new attempt
+must independently satisfy its own advertised total; runs may change between
+attempts. Cached backfills and job listings do not use this restart.
 
 `gha_queue_snapshots` and `gha_queue_snapshot_runs` record successful complete API
 queue listings, including empty queues. An API listing spans multiple sequential

@@ -126,6 +126,78 @@ async fn pagination_collects_all_pages_and_rejects_truncation() -> Result<()> {
 }
 
 #[tokio::test]
+async fn short_active_run_page_reports_filter_and_counts_without_payloads() -> Result<()> {
+    let server = MockGitHub::start(
+        Router::new().route(
+            "/repos/example/repo/actions/runs",
+            get(|| async {
+                Json(json!({"total_count":2,"workflow_runs":[{"id":1,"private_payload":"do-not-log"}]}))
+            }),
+        ),
+        5000,
+    )
+    .await?;
+    let mut client = server.client(None, 10, 100).await?;
+    let error = client
+        .pages(
+            "repos/example/repo/actions/runs",
+            "workflow_runs",
+            &[("status", "in_progress".into())],
+            Some(SEARCH_LIMIT),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    for detail in [
+        "short page",
+        "repos/example/repo/actions/runs",
+        "status",
+        "in_progress",
+        "page=1",
+        "page_items=1",
+        "collected=1",
+        "total_count=2",
+        "per_page=100",
+    ] {
+        assert!(error.contains(detail), "missing {detail}: {error}");
+    }
+    assert!(!error.contains("do-not-log"));
+    assert!(!error.contains("synthetic-secret-token"));
+    assert_eq!(server.count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_second_page_reports_accumulated_count_and_stops() -> Result<()> {
+    let server = MockGitHub::start(
+        Router::new().route(
+            "/jobs",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                let jobs: Vec<_> = if query["page"] == "1" {
+                    (0..100).map(|id| json!({"id":id})).collect()
+                } else {
+                    vec![]
+                };
+                Json(json!({"total_count":101,"jobs":jobs}))
+            }),
+        ),
+        5000,
+    )
+    .await?;
+    let mut client = server.client(None, 10, 100).await?;
+    let error = client
+        .pages("jobs", "jobs", &[], None)
+        .await
+        .unwrap_err()
+        .to_string();
+    for detail in ["page=2", "page_items=0", "collected=100", "total_count=101"] {
+        assert!(error.contains(detail), "missing {detail}: {error}");
+    }
+    assert_eq!(server.count(), 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn oversized_windows_split_at_seconds_without_overlap_and_keep_exactly_1000() -> Result<()> {
     let server = MockGitHub::start(
         Router::new().route(
@@ -397,5 +469,192 @@ async fn resumed_cached_parent_must_match_new_child_counts() -> Result<()> {
     assert!(error.contains("expected 1001, collected 1000"));
     assert_eq!(resumed.cache_hits, 1);
     std::fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+// A script makes unexpected extra requests (including page-local retries) fail.
+async fn scripted_active_listing(
+    responses: Vec<(u64, StatusCode, Value, Option<u64>)>,
+) -> Result<MockGitHub> {
+    let responses = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
+    MockGitHub::start(
+        Router::new().route(
+            "/repos/example/repo/actions/runs",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let responses = Arc::clone(&responses);
+                async move {
+                    assert_eq!(q["status"], "in_progress");
+                    assert_eq!(q["per_page"], "100");
+                    let (page, status, body, remaining) = responses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("unexpected listing request");
+                    assert_eq!(q["page"], page.to_string());
+                    let mut headers = HeaderMap::new();
+                    if let Some(remaining) = remaining {
+                        headers.insert(
+                            "x-ratelimit-remaining",
+                            remaining.to_string().parse().unwrap(),
+                        );
+                    }
+                    (status, headers, Json(body))
+                }
+            }),
+        ),
+        5000,
+    )
+    .await
+}
+
+fn listing(total: u64, ids: impl IntoIterator<Item = i64>) -> Value {
+    json!({"total_count":total,"workflow_runs":ids.into_iter().map(|id| json!({"id":id})).collect::<Vec<_>>()})
+}
+
+#[tokio::test]
+async fn active_listing_restarts_from_page_one_and_discards_failed_attempt() -> Result<()> {
+    for responses in [
+        vec![
+            (1, StatusCode::OK, listing(2, [99]), None),
+            (1, StatusCode::OK, listing(2, [1, 2]), None),
+        ],
+        vec![
+            (1, StatusCode::OK, listing(101, 1000..1100), None),
+            (2, StatusCode::OK, listing(101, []), None),
+            (1, StatusCode::OK, listing(101, 0..100), None),
+            (2, StatusCode::OK, listing(101, [100]), None),
+        ],
+    ] {
+        let expected_requests = responses.len() + 1;
+        let expected_ids: Vec<i64> = if responses.len() == 2 {
+            vec![1, 2]
+        } else {
+            (0..101).collect()
+        };
+        let server = scripted_active_listing(responses).await?;
+        let mut client = server.client(None, expected_requests as u64, 100).await?;
+        let Pages::Complete(runs) =
+            crate::reconcile::active_runs(&mut client, "example/repo", "in_progress").await?
+        else {
+            bail!("unexpected cap")
+        };
+        assert_eq!(
+            runs.iter()
+                .map(|r| r["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(server.count(), expected_requests);
+        assert_eq!(client.requests, expected_requests as u64);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_listing_persistent_short_pages_stop_after_one_restart() -> Result<()> {
+    let server = scripted_active_listing(vec![
+        (1, StatusCode::OK, listing(2, [1]), None),
+        (1, StatusCode::OK, listing(2, [2]), None),
+    ])
+    .await?;
+    let mut client = server.client(None, 100, 100).await?;
+    let error = crate::reconcile::active_runs(&mut client, "example/repo", "in_progress")
+        .await
+        .unwrap_err();
+    assert!(error.is::<ShortPage>());
+    let detail = format!("{error:#}");
+    assert!(detail.contains("after one short-page restart"));
+    assert!(detail.contains("collected=1, total_count=2"));
+    assert_eq!(server.count(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_listing_restart_obeys_existing_budget_and_reserve() -> Result<()> {
+    for (budget, remaining, message) in [
+        (2, None, "request budget reached"),
+        (20, Some(100), "primary rate-limit reserve reached"),
+    ] {
+        let server =
+            scripted_active_listing(vec![(1, StatusCode::OK, listing(2, [1]), remaining)]).await?;
+        let mut client = server.client(None, budget, 100).await?;
+        let error = crate::reconcile::active_runs(&mut client, "example/repo", "in_progress")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(message));
+        assert_eq!(server.count(), 2);
+    }
+    // The restart also stops mid-listing when it consumes the final budget slot.
+    let server = scripted_active_listing(vec![
+        (1, StatusCode::OK, listing(2, [1]), None),
+        (1, StatusCode::OK, listing(101, 0..100), None),
+    ])
+    .await?;
+    let mut client = server.client(None, 3, 100).await?;
+    let error = crate::reconcile::active_runs(&mut client, "example/repo", "in_progress")
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("outbound_requests=3/3"));
+    assert_eq!(server.count(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_listing_keeps_non_short_failures_and_search_cap_terminal() -> Result<()> {
+    for prefix in [false, true] {
+        for (failure, message) in [
+            (
+                vec![(1, StatusCode::OK, json!({"workflow_runs":[]}), None)],
+                "missing total_count",
+            ),
+            (
+                vec![(1, StatusCode::OK, listing(2, [1, 1]), None)],
+                "duplicate item",
+            ),
+            (
+                vec![(1, StatusCode::OK, listing(1, [1, 2]), None)],
+                "more results",
+            ),
+            (
+                vec![
+                    (1, StatusCode::OK, listing(101, 0..100), None),
+                    (2, StatusCode::OK, listing(102, [100, 101]), None),
+                ],
+                "result count changed",
+            ),
+            (
+                vec![(1, StatusCode::TOO_MANY_REQUESTS, json!({}), None)],
+                "429",
+            ),
+            (vec![(1, StatusCode::BAD_GATEWAY, json!({}), None)], "502"),
+        ] {
+            let mut responses = vec![];
+            if prefix {
+                responses.push((1, StatusCode::OK, listing(2, [1]), None));
+            }
+            responses.extend(failure);
+            let count = responses.len() + 1;
+            let server = scripted_active_listing(responses).await?;
+            let mut client = server.client(None, 100, 100).await?;
+            let error = crate::reconcile::active_runs(&mut client, "example/repo", "in_progress")
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+            assert_eq!(server.count(), count);
+        }
+        let mut responses = vec![];
+        if prefix {
+            responses.push((1, StatusCode::OK, listing(2, [1]), None));
+        }
+        responses.push((1, StatusCode::OK, listing(1001, 0..100), None));
+        let count = responses.len() + 1;
+        let server = scripted_active_listing(responses).await?;
+        let mut client = server.client(None, 100, 100).await?;
+        assert!(matches!(
+            crate::reconcile::active_runs(&mut client, "example/repo", "in_progress").await?,
+            Pages::TooMany(1001)
+        ));
+        assert_eq!(server.count(), count);
+    }
     Ok(())
 }
