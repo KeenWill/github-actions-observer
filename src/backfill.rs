@@ -31,6 +31,17 @@ pub(crate) enum Pages {
     TooMany(u64),
 }
 
+#[derive(Debug)]
+pub(crate) struct ShortPage(String);
+
+impl std::fmt::Display for ShortPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ShortPage {}
+
 #[derive(Clone, Copy, Debug)]
 struct CreatedWindow {
     since: DateTime<Utc>,
@@ -120,12 +131,13 @@ impl GitHub {
             if all.len() as u64 == total {
                 return Ok(Pages::Complete(all));
             }
-            ensure!(
-                items.len() == PAGE_SIZE,
+            if items.len() != PAGE_SIZE {
+                return Err(ShortPage(format!(
                 "GitHub returned a short page before total_count was reached; import incomplete: path={path}, parameters={parameters:?}, page={page}, page_items={}, collected={}, total_count={total}, per_page={PAGE_SIZE}",
                 items.len(),
                 all.len()
-            );
+                )).into());
+            }
             page += 1;
         }
     }

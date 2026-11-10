@@ -1,6 +1,6 @@
 //! Fresh API reconciliation complements webhook delivery; snapshots never imply past coverage.
 use crate::{
-    backfill::Pages,
+    backfill::{Pages, ShortPage},
     backfill_http::GitHub,
     config::{Filters, valid_repository},
     model::WorkflowRun,
@@ -13,6 +13,27 @@ use sqlx::PgPool;
 use std::collections::{BTreeMap, BTreeSet};
 
 const ACTIVE_STATUSES: [&str; 5] = ["queued", "pending", "waiting", "requested", "in_progress"];
+
+// Reconciliation supplies an uncached client. Restart the entire filtered listing
+// once, discarding every page from the failed attempt. Both attempts use the same
+// request counter and rate-limit state; transport errors are never retried here.
+pub(crate) async fn active_runs(github: &mut GitHub, name: &str, status: &str) -> Result<Pages> {
+    let path = format!("repos/{name}/actions/runs");
+    let parameters = [("status", status.into())];
+    match github
+        .pages(&path, "workflow_runs", &parameters, Some(1000))
+        .await
+    {
+        Err(error) if error.is::<ShortPage>() => {
+            tracing::warn!(%error, "restarting complete active-run listing once within existing request budget");
+            github
+                .pages(&path, "workflow_runs", &parameters, Some(1000))
+                .await
+                .context("active-run listing failed after one short-page restart")
+        }
+        result => result,
+    }
+}
 
 pub struct ReconcileOptions {
     pub repositories: Vec<String>,
@@ -142,7 +163,7 @@ pub async fn reconcile(pool: &PgPool, filters: &Filters, options: ReconcileOptio
             let mut active = BTreeMap::new();
             let observed_at = chrono::Utc::now();
             for status in ACTIVE_STATUSES {
-                let Pages::Complete(runs) = github.pages(&format!("repos/{name}/actions/runs"), "workflow_runs", &[("status",status.into())], Some(1000)).await? else { anyhow::bail!("active-run search limit reached; no snapshot written for {name}") };
+                let Pages::Complete(runs) = active_runs(&mut github, &name, status).await? else { anyhow::bail!("active-run search limit reached; no snapshot written for {name}") };
                 for run in runs {
                     let model: WorkflowRun = serde_json::from_value(run.clone())?;
                     active.insert(model.id.0, run);

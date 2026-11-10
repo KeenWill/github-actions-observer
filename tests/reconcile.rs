@@ -148,3 +148,163 @@ async fn repairs_missing_cancellation_discovers_queue_and_preserves_payloads() -
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn short_listing_recovery_publishes_only_after_all_statuses_pass() -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+        eprintln!("SKIPPED: TEST_DATABASE_URL is required");
+        return Ok(());
+    };
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await?;
+    let schema = format!(
+        "recovery_test_{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await?;
+    let search_path = format!("SET search_path TO {schema}");
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .after_connect(move |c, _| {
+            let s = search_path.clone();
+            Box::pin(async move {
+                sqlx::query(&s).execute(c).await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await?;
+    store::MIGRATOR.run(&pool).await?;
+    let previous: i64 = sqlx::query_scalar(
+        "INSERT INTO gha_queue_snapshots(repository) VALUES('example/repo') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query("INSERT INTO gha_queue_snapshot_runs(snapshot_id,run_id,run_attempt,status,html_url,created_at) VALUES($1,99,1,'queued','https://example.com/run',now())").bind(previous).execute(&pool).await?;
+    // (persistent short page, calls to final status, all requested statuses).
+    let script = Arc::new(Mutex::new((true, 0_usize, Vec::<String>::new())));
+    let state = Arc::clone(&script);
+    let routes = Router::new()
+        .route(
+            "/rate_limit",
+            get(|| async {
+                Json(json!({"resources":{"core":{"remaining":5000,"reset":4102444800_u64}}}))
+            }),
+        )
+        .route(
+            "/repos/example/repo",
+            get(|| async { Json(json!({"id":1,"full_name":"example/repo"})) }),
+        )
+        .route(
+            "/repos/example/repo/actions/runs",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let state = Arc::clone(&state);
+                async move {
+                    let mut state = state.lock().unwrap();
+                    state.2.push(q["status"].clone());
+                    assert_eq!(q["page"], "1");
+                    let (total, runs) = match q["status"].as_str() {
+                        "queued" => (1, vec![run(2, "queued")]),
+                        "in_progress" => {
+                            state.1 += 1;
+                            if state.0 || state.1 == 1 {
+                                (2, vec![run(88, "in_progress")])
+                            } else {
+                                (2, vec![run(3, "in_progress"), run(4, "in_progress")])
+                            }
+                        }
+                        _ => (0, vec![]),
+                    };
+                    Json(json!({"total_count":total,"workflow_runs":runs}))
+                }
+            }),
+        )
+        .route(
+            "/repos/example/repo/actions/runs/{id}/attempts/1/jobs",
+            get(|| async { Json(json!({"total_count":0,"jobs":[]})) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let api_base = reqwest::Url::parse(&format!("http://{}/", listener.local_addr()?))?;
+    let server = tokio::spawn(async move { axum::serve(listener, routes).await });
+    let filters = Filters::new("", "", "", "")?;
+    let options = |budget| ReconcileOptions {
+        repositories: vec!["example/repo".into()],
+        token: "synthetic".into(),
+        api_base: api_base.clone(),
+        max_requests: budget,
+        rate_limit_reserve: 100,
+    };
+    for (persistent, budget, message) in [
+        (true, 50, "short page"),
+        (false, 7, "request budget reached"),
+    ] {
+        *script.lock().unwrap() = (persistent, 0, vec![]);
+        let error = reconcile(&pool, &filters, options(budget))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(message));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT id FROM gha_queue_snapshots")
+                .fetch_one(&pool)
+                .await?,
+            previous
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT run_id FROM gha_queue_snapshot_runs")
+                .fetch_one(&pool)
+                .await?,
+            99
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM gha_deliveries")
+                .fetch_one(&pool)
+                .await?,
+            0
+        );
+    }
+    *script.lock().unwrap() = (false, 0, vec![]);
+    reconcile(&pool, &filters, options(50)).await?;
+    assert_eq!(
+        script.lock().unwrap().2,
+        [
+            "queued",
+            "pending",
+            "waiting",
+            "requested",
+            "in_progress",
+            "in_progress"
+        ]
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM gha_queue_snapshots")
+            .fetch_one(&pool)
+            .await?,
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT run_id FROM gha_queue_snapshot_runs WHERE snapshot_id <> $1"
+        )
+        .bind(previous)
+        .fetch_one(&pool)
+        .await?,
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT run_id FROM gha_workflow_runs ORDER BY run_id")
+            .fetch_all(&pool)
+            .await?,
+        vec![2, 3, 4]
+    );
+    server.abort();
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await?;
+    Ok(())
+}

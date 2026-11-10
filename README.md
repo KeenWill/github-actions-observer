@@ -138,7 +138,8 @@ allowance and an eight-minute lifetime, then requests a fresh installation token
 limited to `actions:read` and `metadata:read`. The key and token stay out of logs;
 the installation token exists only in process memory. Whitespace-flattened PEM
 files are accepted as well as multiline PEM. The API base must use HTTPS and end
-in `/`; authenticated requests never follow redirects or retry automatically.
+in `/`; authenticated requests never follow redirects. Transport errors and
+non-success HTTP responses are not retried automatically.
 Keep invocation deadlines below the installation token's lifetime (GitHub normally
 issues one-hour tokens); short scheduled runs do not need in-process renewal.
 
@@ -160,6 +161,15 @@ never uses immutable backfill caches. Inaccessible/deleted runs currently fail t
 invocation and require operator investigation; they are never silently treated as
 completed. The current active-run search cap of 1,000 per repository/status fails
 explicitly instead of emitting a truncated queue.
+
+If an active-status run listing returns a short page before its advertised total
+is reached, reconciliation discards that entire filtered listing and restarts it
+once from page one. Every request consumes the same invocation budget and obeys
+the same rate-limit reserve. A second short page, changed total within an attempt,
+duplicate ID, malformed response, search cap, or HTTP failure still fails the
+listing. Totals are never lowered to accept incomplete results. Each new attempt
+must independently satisfy its own advertised total; runs may change between
+attempts. Cached backfills and job listings do not use this restart.
 
 `gha_queue_snapshots` and `gha_queue_snapshot_runs` record successful complete API
 queue listings, including empty queues. An API listing spans multiple sequential
