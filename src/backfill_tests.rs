@@ -126,6 +126,78 @@ async fn pagination_collects_all_pages_and_rejects_truncation() -> Result<()> {
 }
 
 #[tokio::test]
+async fn short_active_run_page_reports_filter_and_counts_without_payloads() -> Result<()> {
+    let server = MockGitHub::start(
+        Router::new().route(
+            "/repos/example/repo/actions/runs",
+            get(|| async {
+                Json(json!({"total_count":2,"workflow_runs":[{"id":1,"private_payload":"do-not-log"}]}))
+            }),
+        ),
+        5000,
+    )
+    .await?;
+    let mut client = server.client(None, 10, 100).await?;
+    let error = client
+        .pages(
+            "repos/example/repo/actions/runs",
+            "workflow_runs",
+            &[("status", "in_progress".into())],
+            Some(SEARCH_LIMIT),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    for detail in [
+        "short page",
+        "repos/example/repo/actions/runs",
+        "status",
+        "in_progress",
+        "page=1",
+        "page_items=1",
+        "collected=1",
+        "total_count=2",
+        "per_page=100",
+    ] {
+        assert!(error.contains(detail), "missing {detail}: {error}");
+    }
+    assert!(!error.contains("do-not-log"));
+    assert!(!error.contains("synthetic-secret-token"));
+    assert_eq!(server.count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_second_page_reports_accumulated_count_and_stops() -> Result<()> {
+    let server = MockGitHub::start(
+        Router::new().route(
+            "/jobs",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                let jobs: Vec<_> = if query["page"] == "1" {
+                    (0..100).map(|id| json!({"id":id})).collect()
+                } else {
+                    vec![]
+                };
+                Json(json!({"total_count":101,"jobs":jobs}))
+            }),
+        ),
+        5000,
+    )
+    .await?;
+    let mut client = server.client(None, 10, 100).await?;
+    let error = client
+        .pages("jobs", "jobs", &[], None)
+        .await
+        .unwrap_err()
+        .to_string();
+    for detail in ["page=2", "page_items=0", "collected=100", "total_count=101"] {
+        assert!(error.contains(detail), "missing {detail}: {error}");
+    }
+    assert_eq!(server.count(), 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn oversized_windows_split_at_seconds_without_overlap_and_keep_exactly_1000() -> Result<()> {
     let server = MockGitHub::start(
         Router::new().route(
