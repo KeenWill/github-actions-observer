@@ -107,7 +107,9 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Set `TEST_DATABASE_URL` to run the PostgreSQL integration test. It creates and drops its own unique schema and requires schema-creation permission. Without the variable, that test reports a skip; CI always provides PostgreSQL. Tests cover signatures/filtering, delivery deduplication, ordering, reruns, transaction rollback, exact SQL time boundaries and listener separation.
+Set `TEST_DATABASE_URL` to run the PostgreSQL integration tests against a disposable PostgreSQL 17+ database. Each test creates and drops its own unique schema and requires schema-creation permission. Without the variable, database tests report a skip. Tests cover signatures/filtering, delivery deduplication, ordering, reruns, transaction rollback, exact SQL time boundaries and listener separation.
+
+`cargo test --locked --test recovery_atomicity -- --nocapture` checks snapshot publication using independent PostgreSQL readers, controlled HTTP pages and separate collector processes. It covers incomplete second pages, exhausted recovery budgets, process termination before retry and during an uncommitted transaction, complete replacement, and deduplication across statuses and repeated invocations. A test-only trigger pauses the second snapshot member insertion; `pg_locks` confirms the writer is blocked after inserting the header and first member. Readers must still see the exact prior snapshot. The test prints `DATABASE_RECEIPT` rows for each boundary. Its ignored `reconcile_subprocess` helper is invoked automatically in child processes; run the parent test, not the helper directly. This exercises the reconciliation library in separate processes, not CLI authentication or deployment.
 
 Build the portable container with `docker build -t github-actions-observer .`. It runs as an unprivileged user. Run `migrate` as a separate deployment job before `serve`. Configure platform probes and private metrics discovery against port 9090.
 
