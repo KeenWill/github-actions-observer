@@ -8,7 +8,8 @@ permissions:
   packages: write
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: cluster-github-actions-observer
     steps:
       - uses: actions/checkout@v4
       - name: Build and publish versioned image
